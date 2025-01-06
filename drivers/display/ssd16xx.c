@@ -16,6 +16,7 @@ LOG_MODULE_REGISTER(ssd16xx);
 #include <zephyr/init.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/mipi_dbi.h>
+#include <zephyr/pm/device.h>
 #include <zephyr/sys/byteorder.h>
 
 #include <zephyr/display/ssd16xx.h>
@@ -752,15 +753,6 @@ static int ssd16xx_set_profile(const struct device *dev,
 		return 0;
 	}
 
-	/*
-	 * Perform a soft reset to make sure registers are reset. This
-	 * will leave the RAM contents intact.
-	 */
-	err = ssd16xx_write_cmd(dev, SSD16XX_CMD_SW_RESET, NULL, 0);
-	if (err < 0) {
-		return err;
-	}
-
 	gdo_len = push_y_param(dev, gdo, last_gate);
 	gdo[gdo_len++] = 0U;
 	err = ssd16xx_write_cmd(dev, SSD16XX_CMD_GDO_CTRL, gdo, gdo_len);
@@ -863,6 +855,17 @@ static int ssd16xx_controller_init(const struct device *dev)
 
 	k_msleep(SSD16XX_RESET_DELAY);
 
+	/*
+	 * Perform a soft reset to make sure registers are reset. This
+	 * will leave the RAM contents intact.
+	 */
+	err = ssd16xx_write_cmd(dev, SSD16XX_CMD_SW_RESET, NULL, 0);
+	if (err < 0) {
+		return err;
+	}
+
+	k_msleep(SSD16XX_RESET_DELAY);
+
 	err = ssd16xx_set_profile(dev, SSD16XX_PROFILE_FULL);
 	if (err < 0) {
 		return err;
@@ -937,6 +940,51 @@ static int ssd16xx_init(const struct device *dev)
 	return ssd16xx_controller_init(dev);
 }
 
+#if defined(CONFIG_PM_DEVICE)
+static int ssd16xx_pm_action(const struct device *dev,
+			     enum pm_device_action action)
+{
+    int err = 0;
+    struct ssd16xx_data *data = dev->data;
+    const struct ssd16xx_config *config = dev->config;
+    const enum ssd16xx_profile_type profile = data->profile;
+
+    switch (action) {
+    case PM_DEVICE_ACTION_RESUME:
+	err = mipi_dbi_reset(config->mipi_dev, SSD16XX_RESET_DELAY);
+	if (err < 0) {
+		return err;
+	}
+
+	data->profile = SSD16XX_PROFILE_INVALID;
+
+	err = ssd16xx_set_profile(dev, profile);
+	if (err < 0) {
+		return err;
+	}
+
+        break;
+
+    case PM_DEVICE_ACTION_SUSPEND:
+	err = ssd16xx_activate(dev, SSD16XX_CTRL2_ENABLE_CLK);
+	if (err < 0) {
+		return err;
+	}
+
+        err = ssd16xx_write_uint8(dev, SSD16XX_CMD_SLEEP_MODE, SSD16XX_SLEEP_MODE_DSM);
+        if (err < 0) {
+            return err;
+        }
+        break;
+
+    default:
+        err = -ENOTSUP;
+    }
+
+    return err;
+}
+#endif /* CONFIG_PM_DEVICE */
+
 static const struct display_driver_api ssd16xx_driver_api = {
 	.blanking_on = ssd16xx_blanking_on,
 	.blanking_off = ssd16xx_blanking_off,
@@ -1002,85 +1050,87 @@ static struct ssd16xx_quirks quirks_solomon_ssd1681 = {
 };
 #endif
 
-#define SOFTSTART_ASSIGN(n)						\
-		.softstart = {						\
-			.data = softstart_##n,				\
-			.len = sizeof(softstart_##n),			\
+#define SOFTSTART_ASSIGN(n)						  \
+		.softstart = {						  \
+			.data = softstart_##n,				  \
+			.len = sizeof(softstart_##n),			  \
 		},
 
-#define SSD16XX_MAKE_ARRAY_OPT(n, p)					\
+#define SSD16XX_MAKE_ARRAY_OPT(n, p)					  \
 	static uint8_t data_ ## n ## _ ## p[] = DT_PROP_OR(n, p, {})
 
-#define SSD16XX_ASSIGN_ARRAY(n, p)					\
-	{								\
-		.data = data_ ## n ## _ ## p,				\
-		.len = sizeof(data_ ## n ## _ ## p),			\
+#define SSD16XX_ASSIGN_ARRAY(n, p)					  \
+	{								  \
+		.data = data_ ## n ## _ ## p,				  \
+		.len = sizeof(data_ ## n ## _ ## p),			  \
 	}
 
-#define SSD16XX_PROFILE(n)						\
-	SSD16XX_MAKE_ARRAY_OPT(n, lut);					\
-	SSD16XX_MAKE_ARRAY_OPT(n, gdv);					\
-	SSD16XX_MAKE_ARRAY_OPT(n, sdv);					\
-									\
-	static const struct ssd16xx_profile ssd16xx_profile_ ## n = {	\
-		.lut = SSD16XX_ASSIGN_ARRAY(n, lut),			\
-		.gdv = SSD16XX_ASSIGN_ARRAY(n, gdv),			\
-		.sdv = SSD16XX_ASSIGN_ARRAY(n, sdv),			\
-		.vcom = DT_PROP_OR(n, vcom, 0),				\
-		.override_vcom = DT_NODE_HAS_PROP(n, vcom),		\
-		.bwf = DT_PROP_OR(n, border_waveform, 0),		\
-		.override_bwf = DT_NODE_HAS_PROP(n, border_waveform),	\
-		.dummy_line = DT_PROP_OR(n, dummy_line, 0),		\
-		.override_dummy_line = DT_NODE_HAS_PROP(n, dummy_line),	\
-		.gate_line_width = DT_PROP_OR(n, gate_line_width, 0),	\
-		.override_gate_line_width = DT_NODE_HAS_PROP(		\
-			n, gate_line_width),				\
+#define SSD16XX_PROFILE(n)						  \
+	SSD16XX_MAKE_ARRAY_OPT(n, lut);					  \
+	SSD16XX_MAKE_ARRAY_OPT(n, gdv);					  \
+	SSD16XX_MAKE_ARRAY_OPT(n, sdv);					  \
+									  \
+	static const struct ssd16xx_profile ssd16xx_profile_ ## n = {	  \
+		.lut = SSD16XX_ASSIGN_ARRAY(n, lut),			  \
+		.gdv = SSD16XX_ASSIGN_ARRAY(n, gdv),			  \
+		.sdv = SSD16XX_ASSIGN_ARRAY(n, sdv),			  \
+		.vcom = DT_PROP_OR(n, vcom, 0),				  \
+		.override_vcom = DT_NODE_HAS_PROP(n, vcom),		  \
+		.bwf = DT_PROP_OR(n, border_waveform, 0),		  \
+		.override_bwf = DT_NODE_HAS_PROP(n, border_waveform),	  \
+		.dummy_line = DT_PROP_OR(n, dummy_line, 0),		  \
+		.override_dummy_line = DT_NODE_HAS_PROP(n, dummy_line),	  \
+		.gate_line_width = DT_PROP_OR(n, gate_line_width, 0),	  \
+		.override_gate_line_width = DT_NODE_HAS_PROP(		  \
+			n, gate_line_width),				  \
 	};
 
 
 #define _SSD16XX_PROFILE_PTR(n) &ssd16xx_profile_ ## n
 
-#define SSD16XX_PROFILE_PTR(n)						\
-	COND_CODE_1(DT_NODE_EXISTS(n),					\
-		    (_SSD16XX_PROFILE_PTR(n)),				\
+#define SSD16XX_PROFILE_PTR(n)						  \
+	COND_CODE_1(DT_NODE_EXISTS(n),					  \
+		    (_SSD16XX_PROFILE_PTR(n)),				  \
 		    NULL)
 
-#define SSD16XX_DEFINE(n, quirks_ptr)					\
-	SSD16XX_MAKE_ARRAY_OPT(n, softstart);				\
-									\
-	DT_FOREACH_CHILD(n, SSD16XX_PROFILE);				\
-									\
-	static const struct ssd16xx_config ssd16xx_cfg_ ## n = {	\
-		.mipi_dev = DEVICE_DT_GET(DT_PARENT(n)),                \
-		.dbi_config = {                                         \
-			.mode = MIPI_DBI_MODE_SPI_4WIRE,                \
-			.config = MIPI_DBI_SPI_CONFIG_DT(n,             \
-				SPI_OP_MODE_MASTER | SPI_WORD_SET(8) |  \
-				SPI_HOLD_ON_CS | SPI_LOCK_ON, 0),       \
-		},                                                      \
-		.busy_gpio = GPIO_DT_SPEC_GET(n, busy_gpios),		\
-		.quirks = quirks_ptr,					\
-		.height = DT_PROP(n, height),				\
-		.width = DT_PROP(n, width),				\
-		.rotation = DT_PROP(n, rotation),			\
-		.tssv = DT_PROP_OR(n, tssv, 0),				\
-		.softstart = SSD16XX_ASSIGN_ARRAY(n, softstart),	\
-		.profiles = {						\
-			[SSD16XX_PROFILE_FULL] =			\
-				SSD16XX_PROFILE_PTR(DT_CHILD(n, full)),	\
-			[SSD16XX_PROFILE_PARTIAL] =			\
+#define SSD16XX_DEFINE(n, quirks_ptr)					  \
+	SSD16XX_MAKE_ARRAY_OPT(n, softstart);				  \
+									  \
+	DT_FOREACH_CHILD(n, SSD16XX_PROFILE);				  \
+									  \
+	static const struct ssd16xx_config ssd16xx_cfg_ ## n = {	  \
+		.mipi_dev = DEVICE_DT_GET(DT_PARENT(n)),                  \
+		.dbi_config = {                                           \
+			.mode = MIPI_DBI_MODE_SPI_4WIRE,                  \
+			.config = MIPI_DBI_SPI_CONFIG_DT(n,               \
+				SPI_OP_MODE_MASTER | SPI_WORD_SET(8) |    \
+				SPI_HOLD_ON_CS | SPI_LOCK_ON, 0),         \
+		},                                                        \
+		.busy_gpio = GPIO_DT_SPEC_GET(n, busy_gpios),		  \
+		.quirks = quirks_ptr,					  \
+		.height = DT_PROP(n, height),				  \
+		.width = DT_PROP(n, width),				  \
+		.rotation = DT_PROP(n, rotation),			  \
+		.tssv = DT_PROP_OR(n, tssv, 0),				  \
+		.softstart = SSD16XX_ASSIGN_ARRAY(n, softstart),	  \
+		.profiles = {						  \
+			[SSD16XX_PROFILE_FULL] =			  \
+				SSD16XX_PROFILE_PTR(DT_CHILD(n, full)),	  \
+			[SSD16XX_PROFILE_PARTIAL] =			  \
 				SSD16XX_PROFILE_PTR(DT_CHILD(n, partial)),\
-		},							\
-	};								\
-									\
-	static struct ssd16xx_data ssd16xx_data_ ## n;			\
-									\
-	DEVICE_DT_DEFINE(n,						\
-			 ssd16xx_init, NULL,				\
-			 &ssd16xx_data_ ## n,				\
-			 &ssd16xx_cfg_ ## n,				\
-			 POST_KERNEL,					\
-			 CONFIG_DISPLAY_INIT_PRIORITY,			\
+		},							  \
+	};								  \
+									  \
+	static struct ssd16xx_data ssd16xx_data_ ## n;			  \
+									  \
+	PM_DEVICE_DT_DEFINE(n, ssd16xx_pm_action);			  \
+	DEVICE_DT_DEFINE(n,						  \
+			 ssd16xx_init,				          \
+			 PM_DEVICE_DT_GET(n),                             \
+			 &ssd16xx_data_ ## n,				  \
+			 &ssd16xx_cfg_ ## n,				  \
+			 POST_KERNEL,					  \
+			 CONFIG_DISPLAY_INIT_PRIORITY,			  \
 			 &ssd16xx_driver_api)
 
 DT_FOREACH_STATUS_OKAY_VARGS(solomon_ssd1608, SSD16XX_DEFINE,
